@@ -86,6 +86,15 @@ impl MessageManager {
     }
 
     pub async fn remove_limit(&mut self, channel: &ChannelId, user_id: UserId) -> Result<String, String> {
+        let result = match self.channel_queues.remove(channel) {
+            Some(old_mux) => {
+                let cq_ref = old_mux.clone();
+                let cq = cq_ref.lock().await;
+                format!("Removed limit ({}) from <#{}>", cq.limit, channel)
+            }
+            None => format!("<#{}> doesn't have a limit!", channel)
+        };
+
         if let Some(db) = self.database.as_ref() {
             let _result_limit = sqlx::query("DELETE FROM channel_limits WHERE channel_id=?").bind(channel.to_string()).execute(db).await.unwrap();
 
@@ -96,7 +105,7 @@ impl MessageManager {
                 .bind(Utc::now().timestamp_millis())
                 .execute(db).await.unwrap();
             // println!("DB update affected {:?} rows", result.rows_affected());
-            return Ok(format!("Removed limit for channel <#{}>!", channel));
+            return Ok(result);
         } else {
             return Err("Database is not initialized".to_string());
         }

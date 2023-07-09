@@ -48,7 +48,7 @@ impl EventHandler for Bot {
                 },
                 "remove" => match MSGMAN.lock().await.remove_limit(&command.channel_id, command.user.id).await {
                     Err(expl) => expl,
-                    Ok(_) => format!("Okay, I removed the limit ")
+                    Ok(expl) => expl
                 }
                 // "ping" => commands::ping::run(&command.data.options),
                 // "id" => commands::id::run(&command.data.options),
