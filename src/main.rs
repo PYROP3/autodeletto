@@ -18,8 +18,11 @@ use msgman::MessageManager;
 struct Bot {}
 
 lazy_static! {
-    static ref MSGMAN: Mutex<MessageManager> = Mutex::new( MessageManager {channel_queues: HashMap::new()} );
+    static ref MSGMAN: Mutex<MessageManager> = Mutex::new( MessageManager {channel_queues: HashMap::new(), ..Default::default()} );
 }
+
+const QUEUE_LIMIT_MIN: i64 = 5;
+const QUEUE_LIMIT_MAX: i64 = 500;
 
 #[async_trait]
 impl EventHandler for Bot {
@@ -29,15 +32,23 @@ impl EventHandler for Bot {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::ApplicationCommand(command) = interaction {
-            println!("Received command interaction: {:#?}", command);
-
             let content = match command.data.name.as_str() {
                 "configure" => match commands::configure::run(&command.data.options) {
                     Err(_) => "Please choose a valid number".to_string(),
                     Ok(new_limit) => {
-                        MSGMAN.lock().await.update_limit(&ctx, &command.channel_id, new_limit as usize).await;
-                        format!("The limit for {} is {}", command.channel_id, new_limit)
+                        if new_limit >= QUEUE_LIMIT_MIN && new_limit <= QUEUE_LIMIT_MAX {
+                            match MSGMAN.lock().await.update_limit(&ctx, &command.channel_id, new_limit as usize, false, Some(command.user.id)).await {
+                                Err(expl) => expl,
+                                Ok(expl) => expl
+                            }
+                        } else {
+                            format!("The limit should be between {} and {}", QUEUE_LIMIT_MIN, QUEUE_LIMIT_MAX)
+                        }
                     }
+                },
+                "remove" => match MSGMAN.lock().await.remove_limit(&command.channel_id, command.user.id).await {
+                    Err(expl) => expl,
+                    Ok(_) => format!("Okay, I removed the limit ")
                 }
                 // "ping" => commands::ping::run(&command.data.options),
                 // "id" => commands::id::run(&command.data.options),
@@ -61,6 +72,8 @@ impl EventHandler for Bot {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
 
+        MSGMAN.lock().await.init(&ctx).await;
+
         let guild_id = GuildId(
             env::var("GUILD_ID")
                 .expect("Expected GUILD_ID in environment")
@@ -71,6 +84,7 @@ impl EventHandler for Bot {
         let commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
             commands
                 .create_application_command(|command| commands::configure::register(command))
+                .create_application_command(|command| commands::remove::register(command))
         })
         .await;
 
@@ -78,6 +92,8 @@ impl EventHandler for Bot {
             Ok(_) => println!("Guild commands created"),
             Err(error) => eprintln!("Error while creating commands: {}", error)
         }
+
+        println!("Bot is ready!")
     }
 }
 
@@ -88,20 +104,6 @@ async fn main() {
 
     // Configure the client with your Discord bot token in the environment.
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-
-    // Initiate a connection to the database file, creating the file if required.
-    let database = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new()
-                .filename("./database/database.sqlite")
-                .create_if_missing(true),
-        )
-        .await
-        .expect("Couldn't connect to database");
-    
-    // Run migrations, which updates the database's schema to the latest version.
-    sqlx::migrate!("./migrations").run(&database).await.expect("Couldn't run database migrations");
 
     let bot = Bot {};
 
