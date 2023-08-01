@@ -1,5 +1,6 @@
 mod commands;
 use std::collections::HashMap;
+use std::process::exit;
 use std::env;
 
 use dotenv::dotenv;
@@ -9,7 +10,7 @@ use serenity::async_trait;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::GuildId;
-use serenity::model::prelude::{Message};
+use serenity::model::prelude::Message;
 use serenity::prelude::*;
 
 mod msgman;
@@ -49,7 +50,11 @@ impl EventHandler for Bot {
                 "remove" => match MSGMAN.lock().await.remove_limit(&command.channel_id, command.user.id).await {
                     Err(expl) => expl,
                     Ok(expl) => expl
-                }
+                },
+                "killswitch" => {
+                    eprintln!("User {} flipped the killswitch!", command.user.id);
+                    exit(1)
+                },
                 // "ping" => commands::ping::run(&command.data.options),
                 // "id" => commands::id::run(&command.data.options),
                 // "attachmentinput" => commands::attachmentinput::run(&command.data.options),
@@ -85,6 +90,7 @@ impl EventHandler for Bot {
             commands
                 .create_application_command(|command| commands::configure::register(command))
                 .create_application_command(|command| commands::remove::register(command))
+                .create_application_command(|command| commands::killswitch::register(command))
         })
         .await;
 
