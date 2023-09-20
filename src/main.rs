@@ -1,25 +1,27 @@
 mod commands;
-use std::collections::HashMap;
+
 use std::process::exit;
 use std::env;
 
 use dotenv::dotenv;
 
-use lazy_static::lazy_static;
+use log::{error, warn, info, debug};
 use serenity::async_trait;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::GuildId;
 use serenity::model::prelude::Message;
+use serenity::model::prelude::application_command::ApplicationCommandInteraction;
 use serenity::prelude::*;
 
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
+
 mod msgman;
-use msgman::MessageManager;
+use msgman::{MessageManagerReceiver,Command};
 
-struct Bot {}
-
-lazy_static! {
-    static ref MSGMAN: Mutex<MessageManager> = Mutex::new( MessageManager {channel_queues: HashMap::new(), ..Default::default()} );
+struct Bot {
+    sender: Sender<Command>,
 }
 
 const QUEUE_LIMIT_MIN: i64 = 5;
@@ -27,57 +29,59 @@ const QUEUE_LIMIT_MAX: i64 = 500;
 
 #[async_trait]
 impl EventHandler for Bot {
-    async fn message(&self, ctx: Context, msg: Message) {
-        MSGMAN.lock().await.insert_message(&ctx, msg, true).await;
+    async fn message(&self, context: Context, message: Message) {
+        if let Err(why) = self.sender.send(Command::MessageReceived { context, message }).await {
+            error!("Error during sendcommand {}", why);
+        }
     }
 
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
-            let content = match command.data.name.as_str() {
-                "configure" => match commands::configure::run(&command.data.options) {
-                    Err(_) => "Please choose a valid number".to_string(),
-                    Ok(new_limit) => {
-                        if new_limit >= QUEUE_LIMIT_MIN && new_limit <= QUEUE_LIMIT_MAX {
-                            match MSGMAN.lock().await.update_limit(&ctx, &command.channel_id, new_limit as usize, false, Some(command.user.id)).await {
-                                Err(expl) => expl,
-                                Ok(expl) => expl
-                            }
-                        } else {
-                            format!("The limit should be between {} and {}", QUEUE_LIMIT_MIN, QUEUE_LIMIT_MAX)
-                        }
-                    }
-                },
-                "remove" => match MSGMAN.lock().await.remove_limit(&command.channel_id, command.user.id).await {
-                    Err(expl) => expl,
-                    Ok(expl) => expl
-                },
-                "killswitch" => {
-                    eprintln!("User {} flipped the killswitch!", command.user.id);
-                    exit(1)
-                },
-                // "ping" => commands::ping::run(&command.data.options),
-                // "id" => commands::id::run(&command.data.options),
-                // "attachmentinput" => commands::attachmentinput::run(&command.data.options),
-                _ => "not implemented :(".to_string(),
-            };
-
-            if let Err(why) = command
-                .create_interaction_response(&ctx.http, |response| {
+    async fn interaction_create(&self, context: Context, interaction: Interaction) {
+        async fn reply(interaction:&ApplicationCommandInteraction, context: &Context, content: String, ephemeral: bool) {
+            if let Err(why) = interaction
+                .create_interaction_response(&context.http, |response| {
                     response
                         .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.content(content).ephemeral(true))
+                        .interaction_response_data(|message| message.content(content).ephemeral(ephemeral))
                 })
                 .await
             {
-                println!("Cannot respond to slash command: {}", why);
+                warn!("Cannot respond to slash command: {}", why);
             }
+        }
+        
+        if let Interaction::ApplicationCommand(command) = interaction {
+            match command.data.name.as_str() {
+                "configure" => match commands::configure::run(&command.data.options) {
+                    Err(_) => reply(&command, &context, "Please choose a valid number".to_string(), true).await,
+                    Ok(limit) => {
+                        if limit >= QUEUE_LIMIT_MIN && limit <= QUEUE_LIMIT_MAX {
+                            if let Err(why) = self.sender.send(Command::SetLimit { limit: limit as usize, context, interaction: command }).await {
+                                error!("Error during sendcommand {}", why);
+                            }
+                        } else {
+                            reply(&command, &context, format!("The limit should be between {} and {}", QUEUE_LIMIT_MIN, QUEUE_LIMIT_MAX), true).await;
+                        }
+                    }
+                },
+                "remove" => {
+                    if let Err(why) = self.sender.send(Command::RemoveLimit { context, interaction: command }).await {
+                        error!("Error during sendcommand {}", why);
+                    }
+                }
+                "killswitch" => {
+                    error!("User {} flipped the killswitch!", command.user.id);
+                    reply(&command, &context, "Killswitch flipped, bye bye~".to_string(), true).await;
+                    exit(1)
+                }
+                _ => reply(&command, &context, "not implemented :(".to_string(), true).await
+            };
         }
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
+        info!("{} is connected!", ready.user.name);
 
-        MSGMAN.lock().await.init(&ctx).await;
+        // self.queue_manager.init(&ctx).await;
 
         let guild_id = GuildId(
             env::var("GUILD_ID")
@@ -95,11 +99,16 @@ impl EventHandler for Bot {
         .await;
 
         match commands {
-            Ok(_) => println!("Guild commands created"),
-            Err(error) => eprintln!("Error while creating commands: {}", error)
+            Ok(_) => debug!("Guild commands created"),
+            Err(error) => error!("Error while creating commands: {}", error)
         }
 
-        println!("Bot is ready!")
+        debug!("Initializing message manager");
+        if let Err(why) = self.sender.send(Command::Initialize { context: ctx }).await {
+            error!("Error during sendcommand {}", why);
+        }
+
+        info!("Bot is ready!")
     }
 }
 
@@ -107,11 +116,16 @@ impl EventHandler for Bot {
 async fn main() {
     // Load .env file
     dotenv().ok();
+    env_logger::init();
+    info!("start main");
 
     // Configure the client with your Discord bot token in the environment.
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
+    let (sender, receiver) = mpsc::channel::<Command>(32);
 
-    let bot = Bot {};
+    let msgman = MessageManagerReceiver { };
+    msgman.run(receiver);
+    let bot = Bot {sender};
 
     // Build our client.
     let intents = 
@@ -128,6 +142,6 @@ async fn main() {
     // Shards will automatically attempt to reconnect, and will perform
     // exponential backoff until it reconnects.
     if let Err(why) = client.start().await {
-        println!("Client error: {:?}", why);
+        error!("Client error: {:?}", why);
     }
 }

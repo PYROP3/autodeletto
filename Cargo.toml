@@ -12,3 +12,5 @@ tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
 sqlx = { version = "0.6.3", features = ["runtime-tokio-rustls", "sqlite", "offline", "chrono"] }
 lazy_static = "1.4.0"
 chrono = "0.4.26"
+log = "0.4"
+env_logger = "0.10"
