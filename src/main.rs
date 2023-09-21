@@ -50,6 +50,7 @@ impl EventHandler for Bot {
         }
         
         if let Interaction::ApplicationCommand(command) = interaction {
+            info!("Received /{} from {} ({}) in {}", command.data.name, command.user.name, command.user.id, command.channel_id);
             match command.data.name.as_str() {
                 "configure" => match commands::configure::run(&command.data.options) {
                     Err(_) => reply(&command, &context, "Please choose a valid number".to_string(), true).await,
