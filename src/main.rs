@@ -48,7 +48,20 @@ impl EventHandler for Bot {
                 warn!("Cannot respond to slash command: {}", why);
             }
         }
-        
+
+        async fn defer(interaction:&ApplicationCommandInteraction, context: &Context, ephemeral: bool) {
+            if let Err(why) = interaction
+                .create_interaction_response(&context.http, |response| {
+                    response
+                        .kind(InteractionResponseType::DeferredChannelMessageWithSource)
+                        .interaction_response_data(|message| message.ephemeral(ephemeral))
+                })
+                .await
+            {
+                warn!("Cannot defer slash command: {}", why);
+            }
+        }
+
         if let Interaction::ApplicationCommand(command) = interaction {
             info!("Received /{} from {} ({}) in {}", command.data.name, command.user.name, command.user.id, command.channel_id);
             match command.data.name.as_str() {
@@ -56,6 +69,7 @@ impl EventHandler for Bot {
                     Err(_) => reply(&command, &context, "Please choose a valid number".to_string(), true).await,
                     Ok(limit) => {
                         if limit >= QUEUE_LIMIT_MIN && limit <= QUEUE_LIMIT_MAX {
+                            defer(&command, &context, true).await;
                             if let Err(why) = self.sender.send(Command::SetLimit { limit: limit as usize, context, interaction: command }).await {
                                 error!("Error during sendcommand {}", why);
                             }
@@ -65,6 +79,7 @@ impl EventHandler for Bot {
                     }
                 },
                 "remove" => {
+                    defer(&command, &context, true).await;
                     if let Err(why) = self.sender.send(Command::RemoveLimit { context, interaction: command }).await {
                         error!("Error during sendcommand {}", why);
                     }

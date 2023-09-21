@@ -5,7 +5,6 @@ use std::collections::{HashMap, VecDeque};
 use chrono::Utc;
 use serenity::model::prelude::application_command::ApplicationCommandInteraction;
 use serenity::model::prelude::{Message, ChannelId, UserId};
-use serenity::model::application::interaction::InteractionResponseType;
 use serenity::futures::StreamExt;
 use serenity::prelude::*;
 use sqlx::{Pool, Sqlite, FromRow};
@@ -53,14 +52,12 @@ struct ChannelLimitDatabaseEntry {
 
 impl MessageManagerReceiver {
     pub fn run(&self, mut receiver: Receiver<Command>) {
-        async fn reply(interaction:&ApplicationCommandInteraction, context: &Context, content: String, ephemeral: bool) {
+        async fn reply_deferred(interaction:&ApplicationCommandInteraction, context: &Context, content: String, _ephemeral: bool) {
             if let Err(why) = interaction
-                .create_interaction_response(&context.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.content(content).ephemeral(ephemeral))
-                })
-                .await
+            .create_followup_message(context, |response| {
+                response
+                .content(content)
+            }).await
             {
                 warn!("Cannot respond to slash command: {}", why);
             }
@@ -78,12 +75,12 @@ impl MessageManagerReceiver {
                     SetLimit { limit, context, interaction } => 
                         {
                             let content = message_manager.update_limit(&context, &interaction.channel_id, limit, false, Some(interaction.user.id)).await;
-                            reply(&interaction, &context, content, true).await;
+                            reply_deferred(&interaction, &context, content, true).await;
                         },
                     RemoveLimit { context, interaction } => 
                         {
                             let content = message_manager.remove_limit(&interaction.channel_id, interaction.user.id).await;
-                            reply(&interaction, &context, content, true).await;
+                            reply_deferred(&interaction, &context, content, true).await;
                         },
                 }
             }
@@ -171,6 +168,28 @@ impl MessageManager {
     }
 
     pub async fn update_limit(&mut self, ctx: &Context, channel: &ChannelId, new_limit: usize, is_init: bool, user_id: Option<UserId>) -> String {
+        
+        async fn update_db(channel: &ChannelId, new_limit: usize, user_id: Option<UserId>, db_ref: Option<&Pool<Sqlite>>) -> Result<(), ()> {
+            if let Some(db) = db_ref {
+                let _result_limit = sqlx::query("INSERT OR REPLACE INTO channel_limits VALUES (?, ?)")
+                    .bind(channel.to_string())
+                    .bind(new_limit as u32)
+                    .execute(db).await.unwrap();
+                debug!("DB update affected {:?} rows", _result_limit.rows_affected());
+
+                let _result_audit = sqlx::query("INSERT INTO channel_limit_edits VALUES (?,?,?,?)")
+                    .bind(user_id.expect("Limit updated but no user received").to_string())
+                    .bind(channel.to_string())
+                    .bind(new_limit as u32)
+                    .bind(Utc::now().timestamp_millis())
+                    .execute(db).await.unwrap();
+                debug!("DB update affected {:?} rows", _result_audit.rows_affected());
+                Ok(())
+            } else {
+                error!("Database is not initialized");
+                Err(())
+            }
+        }
         let Some(queue) = self.channel_queues.get_mut(channel) else {
             // We do not have a queue for this channel yet, so create it
             let new_queue = CappedQueue { queue: VecDeque::with_capacity(new_limit), limit: new_limit};
@@ -202,46 +221,14 @@ impl MessageManager {
             debug!("Sanity set queue limit to {} (message_count={})", new_limit, message_count);
 
             if !is_init {
-                if let Some(db) = self.database.as_ref() {
-                    let _result_limit = sqlx::query("INSERT OR REPLACE INTO channel_limits VALUES (?, ?)")
-                        .bind(channel.to_string())
-                        .bind(new_limit as u32)
-                        .execute(db).await.unwrap();
-                    debug!("DB update affected {:?} rows", _result_limit.rows_affected());
-
-                    let _result_audit = sqlx::query("INSERT INTO channel_limit_edits VALUES (?,?,?,?)")
-                        .bind(user_id.expect("Limit updated but no user received").to_string())
-                        .bind(channel.to_string())
-                        .bind(new_limit as u32)
-                        .bind(Utc::now().timestamp_millis())
-                        .execute(db).await.unwrap();
-                    debug!("DB update affected {:?} rows", _result_audit.rows_affected());
-                } else {
-                    error!("Database is not initialized");
-                }
+                let _ = update_db(channel, new_limit, user_id, self.database.as_ref()).await;
                 return format!("Created limit {} for channel <#{}>, and I'm already purging older messages!", new_limit, channel);
             } else {
                 return format!("Initialized channel {} limit to {}", channel, new_limit);
             }
         };
 
-        if let Some(db) = self.database.as_ref() {
-            let _result_limit = sqlx::query("INSERT OR REPLACE INTO channel_limits VALUES (?, ?)")
-                .bind(channel.to_string())
-                .bind(new_limit as u32)
-                .execute(db).await.unwrap();
-            debug!("DB update affected {:?} rows", _result_limit.rows_affected());
-
-            let _result_audit = sqlx::query("INSERT INTO channel_limit_edits VALUES (?,?,?,?)")
-                .bind(user_id.expect("Limit updated but no user received").to_string())
-                .bind(channel.to_string())
-                .bind(new_limit as u32)
-                .bind(Utc::now().timestamp_millis())
-                .execute(db).await.unwrap();
-            debug!("DB update affected {:?} rows", _result_audit.rows_affected());
-        } else {
-            return "Database is not initialized".to_string()
-        }
+        let _ = update_db(channel, new_limit, user_id, self.database.as_ref()).await;
 
         let old_limit = queue.limit;
         let old_capacity = queue.queue.capacity();
@@ -259,7 +246,7 @@ impl MessageManager {
             format!("Okay, I increased the limit of <#{}> from {} to {}!", channel, old_limit, new_limit)
         } else {
             // Capacity is decreasing, so we need to purge (old_limit - new_limit) messages from the queue
-            let mut remaining_messages = old_limit - new_limit;
+            let mut remaining_messages = if queue.queue.len() > new_limit {queue.queue.len() - new_limit} else {0};
             debug!("Have to delete {} messages", remaining_messages);
             while remaining_messages > 0 {
                 if let Some(old_message) = queue.queue.pop_front() {
