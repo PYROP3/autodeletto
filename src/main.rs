@@ -8,9 +8,10 @@ use dotenv::dotenv;
 use log::{error, warn, info, debug};
 use serenity::async_trait;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
+use serenity::model::prelude::MessageFlags;
 use serenity::model::gateway::Ready;
 use serenity::model::id::GuildId;
-use serenity::model::prelude::Message;
+use serenity::model::prelude::{Message, ChannelPinsUpdateEvent, MessageId, ChannelId};
 use serenity::model::prelude::application_command::ApplicationCommandInteraction;
 use serenity::prelude::*;
 
@@ -30,7 +31,35 @@ const QUEUE_LIMIT_MAX: i64 = 500;
 #[async_trait]
 impl EventHandler for Bot {
     async fn message(&self, context: Context, message: Message) {
+        //debug!("Received message {:#?}", message);
+        debug!("Received NEW message {} (channel={})", message.id, message.channel_id);
+        if let Some(flags) = message.flags {
+            if flags.intersects(MessageFlags::EPHEMERAL) {
+                debug!("Message is ephemeral, ignore it");
+                return;
+            }
+        }
         if let Err(why) = self.sender.send(Command::MessageReceived { context, message }).await {
+            error!("Error during sendcommand {}", why);
+        }
+    }
+
+    async fn message_delete(
+        &self,
+        context: Context,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        guild_id: Option<GuildId>,
+    ) {
+        debug!("Received message {} (channel={}) deletion", message_id, channel_id);
+        if let Err(why) = self.sender.send(Command::MessageDeleted { context, channel_id, message_id, guild_id }).await {
+            error!("Error during sendcommand {}", why);
+        }
+    }
+
+    async fn channel_pins_update(&self, context: Context, pin: ChannelPinsUpdateEvent) {
+        debug!("Received channel_pins_update");
+        if let Err(why) = self.sender.send(Command::ChannelPinsUpdated { context, channel: pin.channel_id }).await {
             error!("Error during sendcommand {}", why);
         }
     }
@@ -151,9 +180,11 @@ async fn main() {
     let bot = Bot {sender};
 
     // Build our client.
-    let intents = 
-        GatewayIntents::GUILD_MESSAGES |
-        GatewayIntents::MESSAGE_CONTENT;
+    // let intents = 
+    //     GatewayIntents::GUILD_MESSAGES |
+    //     GatewayIntents::MESSAGE_CONTENT |
+    //     GatewayIntents::DIRECT_MESSAGES;
+    let intents = GatewayIntents::all();
         
     let mut client = Client::builder(token, intents)
         .event_handler(bot)

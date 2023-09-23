@@ -4,13 +4,15 @@ use std::collections::{HashMap, VecDeque};
 
 use chrono::Utc;
 use serenity::model::prelude::application_command::ApplicationCommandInteraction;
-use serenity::model::prelude::{Message, ChannelId, UserId};
+use serenity::model::prelude::{Message, ChannelId, UserId, MessageId, GuildId};
 use serenity::futures::StreamExt;
 use serenity::prelude::*;
 use sqlx::{Pool, Sqlite, FromRow};
 use string_builder::Builder;
 use tokio::sync::mpsc::Receiver;
 use log::{debug, error, warn, info};
+
+const CHANNEL_PIN_LIMIT: usize = 50;
 
 pub enum Command {
     Initialize {
@@ -19,6 +21,12 @@ pub enum Command {
     MessageReceived {
         context: Context,
         message: Message,
+    },
+    MessageDeleted {
+        context: Context,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        guild_id: Option<GuildId>,
     },
     SetLimit {
         limit: usize,
@@ -33,10 +41,16 @@ pub enum Command {
         context: Context,
         interaction: ApplicationCommandInteraction,
     },
+    ChannelPinsUpdated {
+        context: Context,
+        channel: ChannelId,
+    },
 }
 
+#[derive(Clone)]
 pub struct CappedQueue {
     queue: VecDeque<Message>,
+    pins: VecDeque<Message>,
     limit: usize,
 }
 
@@ -77,6 +91,7 @@ impl MessageManagerReceiver {
                 match cmd {
                     Initialize { context } => {message_manager.init(&context).await;}
                     MessageReceived { context, message } => {message_manager.insert_message(&context, message, true).await;},
+                    MessageDeleted { context, channel_id, message_id, guild_id: _ } => {message_manager.remove_message(&context, message_id, &channel_id);},
                     SetLimit { limit, context, interaction } => 
                         {
                             let content = message_manager.update_limit(&context, &interaction.channel_id, limit, false, Some(interaction.user.id)).await;
@@ -91,7 +106,8 @@ impl MessageManagerReceiver {
                         {
                             let content = message_manager.get_status();
                             reply_deferred(&interaction, &context, content, true).await;
-                        }
+                        },
+                    ChannelPinsUpdated { context, channel } => {message_manager.on_pins_updated(&context, channel).await;},
                 }
             }
         });
@@ -131,13 +147,66 @@ impl MessageManager {
 
     }
 
+    pub async fn on_pins_updated(&mut self, ctx: &Context, channel: ChannelId) {
+        let Some(cq) = self.channel_queues.get_mut(&channel) else { return; };
+        let Ok(updated_pins) = channel.pins(ctx).await else { return; };
+        // updated_pins.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        let mut added_pins = VecDeque::with_capacity(CHANNEL_PIN_LIMIT);
+        let mut removed_pins = Vec::with_capacity(CHANNEL_PIN_LIMIT);
+
+        // First we check for known pins missing from the channel
+        for existing_pin in cq.pins.iter() {
+            if !updated_pins.iter().any(|channel_pin| channel_pin.id == existing_pin.id) {
+                // If the updated pin list does not contain the known `existing_pin` then it was removed
+                removed_pins.push(existing_pin.clone());
+            }
+        }
+        debug!("Removed {} pins", removed_pins.len());
+
+        // Then we check for new pins missing from the queue
+        for channel_pin in updated_pins.iter() {
+            if !cq.pins.iter().any(|existing_pin| channel_pin.id == existing_pin.id) {
+                // If the local pin list does not contain the new `channel_pin` then it was added
+                added_pins.push_back(channel_pin.id);
+            }
+        }
+        debug!("Added {} pins", added_pins.len());
+
+        // We remove the newly-added pins (a.k.a. we retain the non-newly-added pins)
+        cq.queue.retain(|message| !added_pins.contains(&message.id));
+
+        // We re-add the newly-removed pins, sort them, and discard the excess
+        for message in cq.queue.drain(..) {
+            removed_pins.push(message);
+        }
+        debug!("Temporary queue has {} messages (limit={})", removed_pins.len(), cq.limit);
+        removed_pins.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        
+        // Move it back from temporary Vec
+        cq.queue = VecDeque::from(removed_pins);
+        while cq.queue.len() > cq.limit {
+            if let Some(old_message) = cq.queue.pop_front() {
+                debug!("on_pins_updated: Popping and deleting last message (id={}; ts={}) (now {} vs {})", old_message.id, old_message.timestamp, cq.queue.len(), cq.limit);
+                if let Err(error) = old_message.delete(ctx).await {
+                    error!("Failed to delete message: {}", error);
+                }
+            } else {
+                error!("Queue is full but failed to pop message");
+            }
+        }
+
+        cq.pins = updated_pins.into();
+        debug!("Local pins list now has {} items", cq.pins.len());
+    }
+
     pub async fn insert_message(&mut self, ctx: &Context, msg: Message, push_back: bool) {
         let Some(cq) = self.channel_queues.get_mut(&msg.channel_id) else {return};
 
         // If queue is already full, remove the oldest message and delete it
         while cq.queue.len() >= cq.limit {
             if let Some(old_message) = cq.queue.pop_front() {
-                debug!("Popping and deleting last message (now {} vs {})", cq.queue.len(), cq.limit);
+                debug!("insert_message: Popping and deleting last message (now {} vs {})", cq.queue.len(), cq.limit);
                 if let Err(error) = old_message.delete(ctx).await {
                     error!("Failed to delete message: {}", error);
                 }
@@ -151,6 +220,40 @@ impl MessageManager {
             cq.queue.push_front(msg);
         }
         debug!("Pushed new message (now {} vs {})", cq.queue.len(), cq.limit);
+    }
+
+    pub fn remove_message(&mut self, _ctx: &Context, msg_id: MessageId, channel_id: &ChannelId) {
+        let Some(cq) = self.channel_queues.get_mut(channel_id) else {return};
+        cq.queue.retain(|message| message.id != msg_id);
+        cq.pins.retain(|message| message.id != msg_id);
+        debug!("Queue after remove_message len={}", cq.queue.len());
+        debug!("Pins after remove_message len={}", cq.pins.len());
+    }
+
+    pub fn insert_pin(&mut self, _ctx: &Context, msg: Message) {
+        let Some(cq) = self.channel_queues.get_mut(&msg.channel_id) else {return};
+
+        if cq.pins.is_empty() {
+            // Simply insert it
+            debug!("Insert new pin {} (channel={}; ts={}) at the front", msg.id, msg.channel_id, msg.timestamp);
+            cq.pins.push_front(msg);
+            return;
+        }
+
+        // Insert in the correct chronological position
+        let mut index = 0;
+        for queued_msg in cq.pins.iter() {
+            if queued_msg.timestamp > msg.timestamp {
+                debug!("Insert new pin {} (channel={}; ts={}) at idx={} (was msg {}; ts={})", msg.id, msg.channel_id, msg.timestamp, index, queued_msg.id, queued_msg.timestamp);
+                cq.pins.insert(index, msg);
+                return;
+            }
+            index += 1;
+        }
+        
+        // If its still not added, we can assume it is the newest
+        debug!("Insert new pin {} (channel={}; ts={}) at the back (now len={})", msg.id, msg.channel_id, msg.timestamp, cq.pins.len());
+        cq.pins.push_back(msg);
     }
 
     pub fn get_status(&self) -> String {
@@ -216,7 +319,7 @@ impl MessageManager {
         }
         let Some(queue) = self.channel_queues.get_mut(channel) else {
             // We do not have a queue for this channel yet, so create it
-            let new_queue = CappedQueue { queue: VecDeque::with_capacity(new_limit), limit: new_limit};
+            let new_queue = CappedQueue { queue: VecDeque::with_capacity(new_limit), pins: VecDeque::with_capacity(CHANNEL_PIN_LIMIT), limit: new_limit};
             self.channel_queues.insert(*channel, new_queue);
             
             // Now iterate over the channel's messages and delete as needed
@@ -226,6 +329,10 @@ impl MessageManager {
             while let Some(message_result) = all_messages.next().await {
                 match message_result {
                     Ok(msg) => {
+                        if msg.pinned { 
+                            // Skip pinned messages (they are handled separately)
+                            continue;
+                        }
                         if message_count < new_limit {
                             self.insert_message(ctx, msg, false).await
                         } else {
@@ -242,6 +349,18 @@ impl MessageManager {
                 };
                 message_count = message_count + 1;
             }
+
+            match channel.pins(ctx).await {
+                Ok(pinned_messages) => {
+                    for pinned_message in pinned_messages {
+                        self.insert_pin(ctx, pinned_message);
+                    }
+                },
+                Err(error) => {
+                    error!("Uh oh! Error: {}", error);
+                },
+            };
+
             debug!("Sanity set queue limit to {} (message_count={})", new_limit, message_count);
 
             if !is_init {
@@ -274,7 +393,7 @@ impl MessageManager {
             debug!("Have to delete {} messages", remaining_messages);
             while remaining_messages > 0 {
                 if let Some(old_message) = queue.queue.pop_front() {
-                    debug!("Popping and deleting last message (now {} vs {})", queue.queue.len(), queue.limit);
+                    debug!("update_limit: Popping and deleting last message (now {} vs {})", queue.queue.len(), queue.limit);
                     if let Err(error) = old_message.delete(ctx).await {
                         error!("Failed to delete message: {}", error);
                     }
