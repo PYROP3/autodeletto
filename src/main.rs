@@ -77,10 +77,16 @@ impl EventHandler for Bot {
                             reply(&command, &context, format!("The limit should be between {} and {}", QUEUE_LIMIT_MIN, QUEUE_LIMIT_MAX), true).await;
                         }
                     }
-                },
+                }
                 "remove" => {
                     defer(&command, &context, true).await;
                     if let Err(why) = self.sender.send(Command::RemoveLimit { context, interaction: command }).await {
+                        error!("Error during sendcommand {}", why);
+                    }
+                }
+                "status" => {
+                    defer(&command, &context, true).await;
+                    if let Err(why) = self.sender.send(Command::GetStatus { context, interaction: command }).await {
                         error!("Error during sendcommand {}", why);
                     }
                 }
@@ -111,6 +117,7 @@ impl EventHandler for Bot {
                 .create_application_command(|command| commands::configure::register(command))
                 .create_application_command(|command| commands::remove::register(command))
                 .create_application_command(|command| commands::killswitch::register(command))
+                .create_application_command(|command| commands::getstatus::register(command))
         })
         .await;
 

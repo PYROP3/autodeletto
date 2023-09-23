@@ -8,6 +8,7 @@ use serenity::model::prelude::{Message, ChannelId, UserId};
 use serenity::futures::StreamExt;
 use serenity::prelude::*;
 use sqlx::{Pool, Sqlite, FromRow};
+use string_builder::Builder;
 use tokio::sync::mpsc::Receiver;
 use log::{debug, error, warn, info};
 
@@ -25,6 +26,10 @@ pub enum Command {
         interaction: ApplicationCommandInteraction,
     },
     RemoveLimit {
+        context: Context,
+        interaction: ApplicationCommandInteraction,
+    },
+    GetStatus {
         context: Context,
         interaction: ApplicationCommandInteraction,
     },
@@ -82,6 +87,11 @@ impl MessageManagerReceiver {
                             let content = message_manager.remove_limit(&interaction.channel_id, interaction.user.id).await;
                             reply_deferred(&interaction, &context, content, true).await;
                         },
+                    GetStatus { context, interaction } =>
+                        {
+                            let content = message_manager.get_status();
+                            reply_deferred(&interaction, &context, content, true).await;
+                        }
                 }
             }
         });
@@ -141,6 +151,20 @@ impl MessageManager {
             cq.queue.push_front(msg);
         }
         debug!("Pushed new message (now {} vs {})", cq.queue.len(), cq.limit);
+    }
+
+    pub fn get_status(&self) -> String {
+        let mut builder = Builder::default();
+        if self.channel_queues.len() > 0 {
+            builder.append("The following channels are being autodeleted:\n");
+            for (channel, cq) in self.channel_queues.iter() {
+                let usage = (cq.queue.len() as f64) / (cq.limit as f64);
+                builder.append(format!("- {} | {} / {} ({:.0}% full)\n", channel.mention(), cq.queue.len(), cq.limit, usage * 100.0));
+            }
+        } else {
+            builder.append("There are no channels being autodeleted");
+        }
+        builder.string().unwrap()
     }
 
     pub async fn remove_limit(&mut self, channel: &ChannelId, user_id: UserId) -> String {
