@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 
 use chrono::Utc;
 use serenity::model::prelude::application_command::ApplicationCommandInteraction;
-use serenity::model::prelude::{Message, ChannelId, UserId, MessageId, GuildId};
+use serenity::model::prelude::{Message, ChannelId, UserId, MessageId, GuildId, MessageType};
 use serenity::futures::StreamExt;
 use serenity::prelude::*;
 use sqlx::{Pool, Sqlite, FromRow};
@@ -203,15 +203,25 @@ impl MessageManager {
     pub async fn insert_message(&mut self, ctx: &Context, msg: Message, push_back: bool) {
         let Some(cq) = self.channel_queues.get_mut(&msg.channel_id) else {return};
 
+        // Ideally this should not be executed in threads but...
+        // debug!("insert_message {:#?}", msg);
+        match msg.kind {
+            MessageType::ThreadStarterMessage => {
+                debug!("Ignoring message {} of type {:?}", msg.id, msg.kind);
+                return;
+            }
+            _ => {}
+        }
+
         // If queue is already full, remove the oldest message and delete it
         while cq.queue.len() >= cq.limit {
             if let Some(old_message) = cq.queue.pop_front() {
                 debug!("insert_message: Popping and deleting last message (now {} vs {})", cq.queue.len(), cq.limit);
                 if let Err(error) = old_message.delete(ctx).await {
-                    error!("Failed to delete message: {}", error);
+                    error!("insert_message: Failed to delete message: {}", error);
                 }
             } else {
-                error!("Queue is full but failed to pop message");
+                error!("insert_message: Queue is full but failed to pop message");
             }
         }
         if push_back {
@@ -333,12 +343,20 @@ impl MessageManager {
                             // Skip pinned messages (they are handled separately)
                             continue;
                         }
+                        // debug!("update_limit init it {:#?}", msg);
+                        match msg.kind {
+                            MessageType::ThreadStarterMessage => {
+                                debug!("Ignoring message {} of type {:?}", msg.id, msg.kind);
+                                continue;
+                            }
+                            _ => {}
+                        }
                         if message_count < new_limit {
                             self.insert_message(ctx, msg, false).await
                         } else {
                             // We can already delete older messages
                             if let Err(error) = msg.delete(ctx).await {
-                                error!("Failed to delete message: {}", error);
+                                error!("update_limit init: Failed to delete message: {}", error);
                             }
                         }
                     },
@@ -395,7 +413,7 @@ impl MessageManager {
                 if let Some(old_message) = queue.queue.pop_front() {
                     debug!("update_limit: Popping and deleting last message (now {} vs {})", queue.queue.len(), queue.limit);
                     if let Err(error) = old_message.delete(ctx).await {
-                        error!("Failed to delete message: {}", error);
+                        error!("update_limit Failed to delete message: {}", error);
                     }
                 } else {
                     error!("Queue is full but failed to pop message");
