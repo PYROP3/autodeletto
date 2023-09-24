@@ -44,6 +44,19 @@ impl EventHandler for Bot {
         }
     }
 
+    async fn message_delete_bulk(
+        &self,
+        context: Context,
+        channel_id: ChannelId,
+        message_ids: Vec<MessageId>,
+        guild_id: Option<GuildId>,
+    ) {
+        debug!("Received bulk message deletion (channel={})", channel_id);
+        if let Err(why) = self.sender.send(Command::MessagesDeleted { context, channel_id, message_ids, guild_id }).await {
+            error!("Error during sendcommand {}", why);
+        }
+    }
+
     async fn message_delete(
         &self,
         context: Context,

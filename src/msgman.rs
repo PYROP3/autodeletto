@@ -28,6 +28,12 @@ pub enum Command {
         message_id: MessageId,
         guild_id: Option<GuildId>,
     },
+    MessagesDeleted {
+        context: Context,
+        channel_id: ChannelId,
+        message_ids: Vec<MessageId>,
+        guild_id: Option<GuildId>,
+    },
     SetLimit {
         limit: usize,
         context: Context,
@@ -108,6 +114,7 @@ impl MessageManagerReceiver {
                             reply_deferred(&interaction, &context, content, true).await;
                         },
                     ChannelPinsUpdated { context, channel } => {message_manager.on_pins_updated(&context, channel).await;},
+                    MessagesDeleted { context, channel_id, message_ids, guild_id: _ } => {message_manager.remove_messages(&context, message_ids, &channel_id);},
                 }
             }
         });
@@ -238,6 +245,14 @@ impl MessageManager {
         cq.pins.retain(|message| message.id != msg_id);
         debug!("Queue after remove_message len={}", cq.queue.len());
         debug!("Pins after remove_message len={}", cq.pins.len());
+    }
+
+    pub fn remove_messages(&mut self, _ctx: &Context, msg_ids: Vec<MessageId>, channel_id: &ChannelId) {
+        let Some(cq) = self.channel_queues.get_mut(channel_id) else {return};
+        cq.queue.retain(|message| !msg_ids.contains(&message.id));
+        cq.pins.retain(|message| !msg_ids.contains(&message.id));
+        debug!("Queue after remove_messages len={}", cq.queue.len());
+        debug!("Pins after remove_messages len={}", cq.pins.len());
     }
 
     pub fn insert_pin(&mut self, _ctx: &Context, msg: Message) {
