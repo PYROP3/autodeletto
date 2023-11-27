@@ -40,7 +40,8 @@ impl EventHandler for Bot {
             }
         }
         if let Err(why) = self.sender.send(Command::MessageReceived { context, message }).await {
-            panic!("Error during sendcommand {}", why);
+            error!("Error during sendcommand {}", why);
+            exit(1);
         }
     }
 
@@ -53,7 +54,8 @@ impl EventHandler for Bot {
     ) {
         debug!("Received bulk message deletion (channel={})", channel_id);
         if let Err(why) = self.sender.send(Command::MessagesDeleted { context, channel_id, message_ids, guild_id }).await {
-            panic!("Error during sendcommand {}", why);
+            error!("Error during sendcommand {}", why);
+            exit(1);
         }
     }
 
@@ -66,14 +68,16 @@ impl EventHandler for Bot {
     ) {
         debug!("Received message {} (channel={}) deletion", message_id, channel_id);
         if let Err(why) = self.sender.send(Command::MessageDeleted { context, channel_id, message_id, guild_id }).await {
-            panic!("Error during sendcommand {}", why);
+            error!("Error during sendcommand {}", why);
+            exit(1);
         }
     }
 
     async fn channel_pins_update(&self, context: Context, pin: ChannelPinsUpdateEvent) {
         debug!("Received channel_pins_update");
         if let Err(why) = self.sender.send(Command::ChannelPinsUpdated { context, channel: pin.channel_id }).await {
-            panic!("Error during sendcommand {}", why);
+            error!("Error during sendcommand {}", why);
+            exit(1);
         }
     }
 
@@ -113,7 +117,8 @@ impl EventHandler for Bot {
                         if limit >= QUEUE_LIMIT_MIN && limit <= QUEUE_LIMIT_MAX {
                             defer(&command, &context, true).await;
                             if let Err(why) = self.sender.send(Command::SetLimit { limit: limit as usize, context, interaction: command }).await {
-                                panic!("Error during sendcommand {}", why);
+                                error!("Error during sendcommand {}", why);
+                                exit(1);
                             }
                         } else {
                             reply(&command, &context, format!("The limit should be between {} and {}", QUEUE_LIMIT_MIN, QUEUE_LIMIT_MAX), true).await;
@@ -123,13 +128,15 @@ impl EventHandler for Bot {
                 "remove" => {
                     defer(&command, &context, true).await;
                     if let Err(why) = self.sender.send(Command::RemoveLimit { context, interaction: command }).await {
-                        panic!("Error during sendcommand {}", why);
+                        error!("Error during sendcommand {}", why);
+                        exit(1);
                     }
                 }
                 "status" => {
                     defer(&command, &context, true).await;
                     if let Err(why) = self.sender.send(Command::GetStatus { context, interaction: command }).await {
-                        panic!("Error during sendcommand {}", why);
+                        error!("Error during sendcommand {}", why);
+                        exit(1);
                     }
                 }
                 "killswitch" => {
